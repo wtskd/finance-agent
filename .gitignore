@@ -1,0 +1,20 @@
+# ---------- 构建产物 ----------
+target/
+*.class
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# ---------- 本地凭据（含真实密码，绝不提交）----------
+#   模板见 dev.local.sh.example
+dev.local.sh
+
+# ---------- 日志与临时文件 ----------
+*.log
+logs/
+*.tmp
+.tmp_readonly.sql

@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>财务问数 Agent · NL2SQL / ChatBI</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --border: #e3e6ea;
+    --text: #111827;
+    --muted: #6b7280;
+    --faint: #9ca3af;
+    --accent: #2563eb;
+    --accent-soft: #eff4ff;
+    --ok: #059669;
+    --warn: #b45309;
+    --warn-soft: #fef3c7;
+    --code-bg: #0f172a;
+    --code-text: #e2e8f0;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 15px; line-height: 1.65;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+
+  /* ---------- 页头 ---------- */
+  header { margin-bottom: 22px; }
+  h1 { margin: 0 0 6px; font-size: 25px; letter-spacing: -.2px; }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 12px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 7px; }
+  .badge {
+    font-size: 12px; color: var(--muted);
+    background: var(--card); border: 1px solid var(--border);
+    padding: 3px 9px; border-radius: 999px;
+  }
+  .badge.hl { color: var(--accent); border-color: #c7d8fd; background: var(--accent-soft); }
+
+  /* ---------- 卡片 ---------- */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 16px;
+  }
+  .card h2 {
+    margin: 0 0 14px; font-size: 14px; color: var(--muted);
+    font-weight: 600; letter-spacing: .3px;
+  }
+
+  /* ---------- 输入区 ---------- */
+  .ask-row { display: flex; gap: 10px; align-items: flex-start; }
+  textarea {
+    flex: 1; resize: vertical; min-height: 54px; max-height: 180px;
+    padding: 12px 14px; font: inherit;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: #fbfbfc; color: var(--text); outline: none;
+  }
+  textarea:focus { border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px var(--accent-soft); }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    border: 0; border-radius: 10px; padding: 12px 22px;
+    background: var(--accent); color: #fff; white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: #1d4ed8; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .samples { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
+  .chip {
+    font-size: 13px; color: var(--muted); cursor: pointer;
+    background: #fafbfc; border: 1px solid var(--border);
+    padding: 5px 11px; border-radius: 999px;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .chip.risk { color: var(--warn); border-color: #fde68a; background: #fffbeb; }
+  .chip.risk:hover { background: var(--warn-soft); }
+
+  /* ---------- 节点轨迹 ---------- */
+  .trace { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .node {
+    font-size: 12.5px; padding: 5px 11px; border-radius: 8px;
+    background: #f3f4f6; color: var(--muted); border: 1px solid var(--border);
+  }
+  .node.done { background: var(--accent-soft); color: var(--accent); border-color: #c7d8fd; }
+  .node.retry { background: var(--warn-soft); color: var(--warn); border-color: #fde68a; font-weight: 600; }
+  .node small { display: block; font-size: 10.5px; opacity: .75; font-weight: 400; }
+  .arrow { color: var(--faint); font-size: 12px; }
+
+  /* ---------- 代码块 ---------- */
+  pre {
+    margin: 0; padding: 15px 17px; overflow-x: auto;
+    background: var(--code-bg); color: var(--code-text);
+    border-radius: 10px; font-size: 13px; line-height: 1.6;
+    font-family: Consolas, Monaco, "Courier New", monospace;
+  }
+
+  /* ---------- 结果表格 ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12.5px; background: #fafbfc; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  .table-scroll table { min-width: 100%; }
+
+  /* ---------- 最终回答 ---------- */
+  .answer {
+    white-space: pre-wrap; word-break: break-word;
+    border-left: 3px solid var(--ok); padding: 4px 0 4px 15px;
+    font-size: 15.5px;
+  }
+
+  /* ---------- 元信息 ---------- */
+  .meta { display: flex; flex-wrap: wrap; gap: 20px; color: var(--muted); font-size: 13px; }
+  .meta b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  .empty { color: var(--faint); font-size: 14px; text-align: center; padding: 26px 0; }
+  .hidden { display: none; }
+  .err {
+    color: #b91c1c; background: #fef2f2;
+    border: 1px solid #fecaca; border-radius: 10px; padding: 13px 15px;
+    font-size: 14px; word-break: break-all;
+  }
+  .spinner {
+    display: inline-block; width: 13px; height: 13px; margin-right: 7px;
+    border: 2px solid #c7d8fd; border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  footer { text-align: center; color: var(--faint); font-size: 12.5px; margin-top: 26px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>财务问数 Agent</h1>
+    <div class="sub">用自然语言提问，Agent 自动生成只读 SQL 并给出结论 · NL2SQL / ChatBI</div>
+    <div class="badges">
+      <span class="badge hl">Spring AI Alibaba Graph</span>
+      <span class="badge">Java 17</span>
+      <span class="badge">MySQL 8</span>
+      <span class="badge">DeepSeek</span>
+      <span class="badge">9 节点图编排</span>
+      <span class="badge">SQL 三层只读防线</span>
+      <span class="badge">Schema 召回 (RAG)</span>
+    </div>
+  </header>
+
+  <div class="card">
+    <h2>提问</h2>
+    <div class="ask-row">
+      <textarea id="q" placeholder="例如：上个月支出多少？"></textarea>
+      <button id="send">发送</button>
+    </div>
+    <div class="samples" id="samples"></div>
+  </div>
+
+  <div class="card hidden" id="statusCard">
+    <div id="status"></div>
+  </div>
+
+  <div class="card hidden" id="traceCard">
+    <h2>执行轨迹</h2>
+    <div class="trace" id="trace"></div>
+    <div class="meta" style="margin-top:15px" id="metrics"></div>
+  </div>
+
+  <div class="card hidden" id="sqlCard">
+    <h2>Agent 生成的 SQL</h2>
+    <pre id="sql"></pre>
+  </div>
+
+  <div class="card hidden" id="resultCard">
+    <h2>查询结果</h2>
+    <div class="table-scroll" id="result"></div>
+  </div>
+
+  <div class="card hidden" id="answerCard">
+    <h2>结论</h2>
+    <div class="answer" id="answer"></div>
+  </div>
+
+  <footer>本项目为求职作品集演示 · SQL 全链路只读，写操作由代码层与数据库账号双重拦截</footer>
+</div>
+
+<script>
+// 节点名 → 中文说明。后端只回传节点名，展示文案放在前端，
+// 这样调整措辞不用重新编译 Java。
+const NODE_INFO = {
+  understand: ['理解意图',   '判断能否回答'],
+  recall:     ['召回表结构', 'Schema 召回 (RAG)'],
+  generate:   ['生成 SQL',   '大模型单步生成'],
+  verify:     ['需求核对',   '规则检查条件是否漏'],
+  validate:   ['安全校验',   'SqlGuard 8 步检查'],
+  execute:    ['执行查询',   '只读账号 + 超时'],
+  report:     ['生成回答',   '结果转自然语言'],
+  refuse:     ['拒绝回答',   '超出能力范围'],
+  giveUp:     ['放弃并说明', '超过重试上限'],
+};
+
+const SAMPLES = [
+  { text: '上个月支出多少？' },
+  { text: '这个月餐饮花了多少钱？' },
+  { text: '我各个账户的余额分别是多少？' },
+  { text: '收入减掉支出还剩多少？' },
+  { text: '每个月的支出分别是多少？' },
+  { text: '帮我把所有交易记录都删掉', risk: true },
+  { text: '今天天气怎么样', risk: true },
+];
+
+const $ = id => document.getElementById(id);
+const show = (id, on) => $(id).classList.toggle('hidden', !on);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// 示例问题
+SAMPLES.forEach(s => {
+  const el = document.createElement('span');
+  el.className = 'chip' + (s.risk ? ' risk' : '');
+  el.textContent = (s.risk ? '⚠ ' : '') + s.text;
+  el.onclick = () => { $('q').value = s.text; $('q').focus(); };
+  $('samples').appendChild(el);
+});
+
+function reset() {
+  show('statusCard', false);
+  ['traceCard', 'sqlCard', 'resultCard', 'answerCard'].forEach(id => show(id, false));
+}
+
+function status(html) {
+  show('statusCard', true);
+  $('status').innerHTML = html;
+}
+
+function renderTrace(trace) {
+  const seen = new Set();
+  const box = $('trace');
+  box.innerHTML = '';
+  trace.forEach((name, i) => {
+    if (i > 0) {
+      const a = document.createElement('span');
+      a.className = 'arrow';
+      a.textContent = '→';
+      box.appendChild(a);
+    }
+    const info = NODE_INFO[name] || [name, ''];
+    const el = document.createElement('span');
+    // 同一个节点第二次出现 = 走了重试回路，标黄提醒
+    const isRetry = seen.has(name);
+    el.className = 'node ' + (isRetry ? 'retry' : 'done');
+    el.innerHTML = esc(info[0]) + '<small>' + esc(info[1]) + (isRetry ? ' · 重试' : '') + '</small>';
+    box.appendChild(el);
+    seen.add(name);
+  });
+}
+
+function renderTable(result) {
+  const cols = result.columns || [];
+  const rows = result.rows || [];
+  if (!cols.length || !rows.length) {
+    $('result').innerHTML = '<div class="empty">查询成功，但没有匹配的数据</div>';
+    return;
+  }
+  let html = '<table><thead><tr>' + cols.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>';
+  rows.forEach(row => {
+    html += '<tr>' + row.map(v =>
+      v === null ? '<td class="num" style="color:#9ca3af">NULL</td>'
+        : typeof v === 'number' ? '<td class="num">' + Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }) + '</td>'
+          : '<td>' + esc(v) + '</td>').join('') + '</tr>';
+  });
+  html += '</tbody></table>';
+  if (result.truncated) {
+    html += '<div class="empty">结果超过 ' + result.rowCount + ' 行，已截断</div>';
+  }
+  $('result').innerHTML = html;
+}
+
+async function ask() {
+  const question = $('q').value.trim();
+  if (!question) return;
+
+  reset();
+  $('send').disabled = true;
+  status('<span class="spinner"></span>Agent 正在思考…（通常 2–5 秒）');
+
+  try {
+    const res = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question })
+    });
+    const data = await res.json();
+
+    if (!data.ok) {
+      status('<div class="err">' + esc(data.error || '未知错误') + '</div>');
+      return;
+    }
+
+    show('statusCard', false);
+
+    renderTrace(data.trace || []);
+    show('traceCard', true);
+
+    $('metrics').innerHTML =
+      '<span>token <b>' + (data.tokens ?? 0) + '</b></span>' +
+      '<span>耗时 <b>' + (data.elapsedMs ?? 0) + ' ms</b></span>' +
+      '<span>SQL 尝试 <b>' + (data.attempts ?? 0) + '</b> 次</span>' +
+      (data.verifyNote ? '<span>核对 <b>' + esc(String(data.verifyNote).split(' ｜')[0]) + '</b></span>' : '');
+
+    if (data.sql) {
+      $('sql').textContent = data.sql;
+      show('sqlCard', true);
+    }
+
+    if (data.result) {
+      renderTable(data.result);
+      show('resultCard', true);
+    }
+
+    $('answer').textContent = data.answer || '';
+    show('answerCard', true);
+  } catch (e) {
+    status('<div class="err">请求失败：' + esc(e.message) + '</div>');
+  } finally {
+    $('send').disabled = false;
+  }
+}
+
+$('send').onclick = ask;
+$('q').addEventListener('keydown', e => {
+  // Ctrl/Cmd + Enter 发送；单独 Enter 换行（问题可能比较长）
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); ask(); }
+});
+$('q').focus();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# ============================================================
+# 数据库凭据模板
+# ------------------------------------------------------------
+# 用法：
+#   cp dev.local.sh.example dev.local.sh
+#   然后把下面的占位符换成你自己的真实密码
+#
+# 说明：
+#   dev.local.sh 已在 .gitignore 里，不会被提交到仓库。
+#   dev.sh 会在启动时自动 source 它，所以命令无需任何改动。
+#
+# 变量含义：
+#   FINANCE_DB_ROOT_*     root 账号 —— 只有 db-init 建库建表时用
+#   FINANCE_DB_*          只读账号 ai_readonly —— 跑 Agent 时用（最小权限）
+# ============================================================
+export FINANCE_DB_ROOT_USER='root'
+export FINANCE_DB_ROOT_PASSWORD='your_mysql_root_password'
+export FINANCE_DB_USER='ai_readonly'
+export FINANCE_DB_PASSWORD='your_readonly_password'
