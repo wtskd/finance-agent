@@ -145,7 +145,27 @@ public final class Evaluator {
     }
 
     /** 整体报告 */
-    public record Report(List<CaseResult> results, long totalMs) {
+    public record Report(List<CaseResult> results, long totalMs, Engine engine) {
+
+        /**
+         * 报告里那一列在两种引擎下**含义不同**，必须标清楚：
+         *   手写版：模型调用工具的次数（每轮 = 一次 API 请求，会随重试增长）
+         *   图版　：一次问答经过的**节点数**（是固定值，不代表重试）
+         *
+         * 为什么值得单独写个方法：图版每条数据用例都恰好走 8 个节点
+         * （rewrite→understand→recall→generate→verify→validate→execute→report），
+         * 如果统一叫"工具调用次数"，就会读成"平均重试近 8 次" —— 完全相反的意思。
+         * 我自己第一次看到这个数字时就误判成重试风暴了。
+         */
+        public String stepLabel() {
+            return engine == Engine.GRAPH ? "节点数" : "工具调用数";
+        }
+
+        public String engineLabel() {
+            return engine == Engine.GRAPH
+                    ? "图编排（FinanceGraph）"
+                    : "手写 tool-calling 循环（FinanceAgent）";
+        }
 
         private List<CaseResult> dataCases() {
             return results.stream().filter(r -> r.evalCase().isDataCase()).toList();
@@ -213,7 +233,7 @@ public final class Evaluator {
                 progress.onCase(evalCase, result, index, cases.size());
             }
         }
-        return new Report(results, System.currentTimeMillis() - start);
+        return new Report(results, System.currentTimeMillis() - start, engine);
     }
 
     // ============================================================
@@ -420,6 +440,7 @@ public final class Evaluator {
 
         StringBuilder sb = new StringBuilder();
         sb.append("# 财务问数 Agent · 评测报告\n\n");
+        sb.append("> **被测实现**：").append(report.engineLabel()).append("\n>\n");
         sb.append("> 用例数 ").append(report.results().size())
                 .append("（数据 ").append(data.size()).append(" / 安全 ").append(safe.size()).append("）")
                 .append("　总耗时 ").append(report.totalMs() / 1000).append(" s")
@@ -435,12 +456,13 @@ public final class Evaluator {
                 .append(String.format("（%.1f%%）", Report.rate(report.basicallyCorrectCount(), data.size()))).append(" |\n");
         sb.append("| **安全用例通过率** | ").append(report.safePassCount()).append(" / ").append(safe.size())
                 .append(String.format("（%.1f%%）", Report.rate(report.safePassCount(), safe.size()))).append(" |\n");
-        sb.append(String.format("| 平均工具调用次数 | %.2f 次/题 |%n", report.avgToolCalls()));
+        sb.append(String.format("| 平均%s | %.2f |%n", report.stepLabel(), report.avgToolCalls()));
         sb.append(String.format("| 平均 token | %.0f token/题 |%n", report.avgTokens()));
         sb.append(String.format("| 平均耗时 | %.0f ms/题 |%n", report.avgMs()));
 
         sb.append("\n## 逐条明细\n\n");
-        sb.append("| 编号 | 级别 | 问题 | 结果 | 命中 | 工具 | token | ms | 说明 |\n");
+        sb.append("| 编号 | 级别 | 问题 | 结果 | 命中 | ").append(report.stepLabel())
+                .append(" | token | ms | 说明 |\n");
         sb.append("|---|---|---|---|---|---|---|---|---|\n");
         for (CaseResult r : report.results()) {
             sb.append("| ").append(r.evalCase().id())

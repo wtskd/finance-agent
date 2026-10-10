@@ -131,14 +131,18 @@ public class Step8Main {
             System.out.printf("安全用例通过率        : %d / %d  (%.1f%%)%n",
                     report.safePassCount(), safeTotal, pct(report.safePassCount(), safeTotal));
         }
-        System.out.printf("平均工具调用          : %.2f 次/题%n", report.avgToolCalls());
+        // 这一列的标签随引擎变化：图版统计的是"经过的节点数"，不是"工具调用/重试次数"。
+        // 用 Text.padRight 而不是 printf 的 %-22s —— 后者按字符数补齐，
+        // 中文会错位（一个汉字占两个显示宽度）。
+        System.out.println(Text.padRight("平均" + report.stepLabel(), 22) + ": "
+                + String.format("%.2f", report.avgToolCalls()) + " 次/题");
         System.out.printf("平均 token            : %.0f token/题（合计 %d）%n", report.avgTokens(), report.totalTokens());
         System.out.printf("平均耗时              : %.0f ms/题（总 %d s）%n", report.avgMs(), report.totalMs() / 1000);
         System.out.println();
         System.out.println("看数字的提醒：");
         System.out.println("  1. 「完全正确」比「基本正确」严格 —— 分组类问题要求每一个数字都对。");
         System.out.println("  2. 数值比对只测「数据对不对」，测不出「表达好不好」，后者需要人工抽检。");
-        System.out.println("  3. 单轮 20 条有随机性（模型不完全确定），要判断改动是否有效，应多跑两轮看趋势。");
+        System.out.println("  3. 单轮 26 条有随机性（模型不完全确定），要判断改动是否有效，应多跑两轮看趋势。");
     }
 
     private static double pct(long part, long total) {

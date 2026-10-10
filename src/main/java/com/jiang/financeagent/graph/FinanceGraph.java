@@ -6,6 +6,7 @@ import com.alibaba.cloud.ai.graph.StateGraph;
 import com.alibaba.cloud.ai.graph.action.AsyncEdgeAction;
 import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
 import com.jiang.financeagent.agent.LlmClient;
+import com.jiang.financeagent.metric.MetricSet;
 import com.jiang.financeagent.rag.SchemaChunk;
 import com.jiang.financeagent.tool.SchemaTool;
 import com.jiang.financeagent.tool.SqlGuard;
@@ -171,10 +172,18 @@ public final class FinanceGraph {
 
     private final LlmClient llm;
     private final boolean verbose;
+    private final MetricSet metrics;
 
     public FinanceGraph(LlmClient llm, boolean verbose) {
         this.llm = llm;
         this.verbose = verbose;
+        this.metrics = MetricSet.load();
+        if (verbose) {
+            // 加载情况要能看见。指标配置读不到时程序**不会报错**（会降级），
+            // 所以"静默降级"是这里最危险的失败模式 —— 看起来一切正常，
+            // 实际语义层根本没生效。打一行日志，让降级可见。
+            System.out.println("[语义层] " + metrics.loadNote());
+        }
     }
 
     // ============================================================
@@ -413,6 +422,26 @@ public final class FinanceGraph {
      *
      * 【这里是循环的入口，所以 attempts 在这里 +1】
      *   把"计数"放在循环入口而不是出口，保证无论从哪条边回来都只计一次。
+     *
+     * ============================================================
+     * 第 13 步：业务口径不再写在提示词里
+     * ============================================================
+     *   改之前，这个方法里的提示词有这样一段自然语言规则：
+     *     「问『支出多少』→ WHERE status='支出' 之后 SUM(amount)……
+     *       **只有**问『净额 / 结余 / 还剩多少』时，才用 CASE WHEN 那个式子」
+     *
+     *   它有三个结构性缺陷：
+     *     1. 用户说法和口径不是一一对应 —— 问「我赚了多少」这句，
+     *        它既没匹配到「支出」也没匹配到「结余」，只能靠模型猜
+     *     2. 改口径要动 Java 代码 + 重新编译
+     *     3. 没有单一事实来源：口径散在几百字的提示词里
+     *
+     *   现在改成从 config/metrics.json 读，**命中项直接注入表达式**：
+     *     指标定义、别名词表、是否适用 —— 全是配置；匹配是纯规则（零 token）；
+     *     generate 从"理解业务口径"降级为"把已定好的表达式填进 SQL"。
+     *
+     *   注意 metricsBlock 在**没命中时也不是空的** —— 它会换成一段最小兜底说明，
+     *   保证"关掉语义层"等价于"改动前行为"（A/B 对比才有意义）。
      */
     private Map<String, Object> generate(OverAllState state) throws Exception {
         int attempts = intVal(state, K_ATTEMPTS) + 1;
@@ -423,6 +452,10 @@ public final class FinanceGraph {
         String feedbackBlock = feedback.isBlank()
                 ? "（这是第一次尝试）"
                 : "上一次的尝试失败了，原因是：\n" + feedback + "\n请针对这个原因修正后再输出一条 SQL。";
+
+        // 命中的业务口径（纯规则匹配，零 token）。
+        // 没命中时返回一段最小兜底说明，保证"关掉语义层"等价于改动前的行为。
+        String metricsBlock = metrics.renderForPrompt(question);
 
         String sql = cleanSql(llm.complete("""
                 你是 MySQL 专家。根据给定的表结构，把用户问题写成一条 SELECT 查询。
@@ -446,12 +479,7 @@ public final class FinanceGraph {
                   · 需要加时间时，区间已经由系统算好（见下方「时间条件参考」），
                     直接照抄对应的具体日期即可，不要自己用 CURDATE / DATE_SUB 推算。
                 - t_transaction.status 的值是中文「收入」或「支出」，不要用数字编码
-                - t_transaction.amount 恒为正数，方向由 status 决定：
-                  · 问「支出多少」→ WHERE status = '支出' 之后 SUM(amount)
-                  · 问「收入多少」→ WHERE status = '收入' 之后 SUM(amount)
-                  · **只有**问「净额 / 结余 / 收入减支出 / 还剩多少」时，才用
-                    SUM(CASE WHEN status = '收入' THEN amount ELSE -amount END)
-                  ★ 不要因为公式复杂就默认使用它——它对「支出多少」这类问题算出来是错的
+                - t_transaction.amount 恒为正数，方向由 status 决定
                 - 需要多表时显式写出 JOIN ... ON
                 """, """
                 表结构：
@@ -460,10 +488,12 @@ public final class FinanceGraph {
                 【时间条件参考】（**仅当问题里出现相对时间词时才使用**）
                 %s
 
+                %s
+
                 用户问题：%s
 
                 %s
-                """.formatted(schema, timeReference(), question, feedbackBlock)));
+                """.formatted(schema, timeReference(), metricsBlock, question, feedbackBlock)));
 
         log("generate", "第 " + attempts + " 次生成 SQL：" + oneLine(sql));
 
@@ -578,10 +608,27 @@ public final class FinanceGraph {
         String where = whereClause(sql);
 
         // ---- ① 收支方向：问题提到就必须落到 SQL 里 ----
-        if (question.contains("收入") && !sql.contains("收入")) {
+        // ★ 但"净额式"写法必须豁免。
+        //   SUM(CASE WHEN status = '收入' THEN amount ELSE -amount END)
+        //   这个表达式用**减法**表达了方向，里面根本不会出现「支出」二字 ——
+        //   可两个方向其实都被它覆盖了。不豁免的话，一条完全正确的 SQL
+        //   会被判成"漏了支出条件"，然后进入注定失败的重试循环
+        //   （实测 D17「收入减掉支出还剩多少」就是这么挂的）。
+        //
+        //   这是"字面检查"第三次栽在同一个坑上：
+        //     · 第 1 次：只看 create_time 有没有出现，不管它在 WHERE 还是 GROUP BY
+        //     · 第 2 次：识别不到「8 月」这类具体月份写法
+        //     · 第 3 次（本次）：语义层把口径换成 -amount 之后，
+        //       "SQL 里有没有『支出』二字"这个判据失效了
+        //   规律很清楚：**规则只要依赖字面，就会在"同一个意思换种写法"时失效**。
+        //   所以每次给 SQL 的表达方式增加自由度（比如这次引入指标表达式），
+        //   都得回头把依赖字面的规则再过一遍。
+        boolean netStyle = upper.matches("(?s).*-\\s*AMOUNT.*");
+
+        if (!netStyle && question.contains("收入") && !sql.contains("收入")) {
             missing.add("问题提到「收入」，但 SQL 里没有收入相关的条件或计算");
         }
-        if (question.contains("支出") && !sql.contains("支出")) {
+        if (!netStyle && question.contains("支出") && !sql.contains("支出")) {
             missing.add("问题提到「支出」，但 SQL 里没有支出相关的条件或计算");
         }
 
