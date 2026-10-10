@@ -15,6 +15,7 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -516,8 +517,8 @@ public final class FinanceGraph {
         // 光看"通过/不通过"是不够的，必须能看到规则读到的输入是什么。
         String note = (missing.isEmpty() ? "通过" : "缺：" + String.join("；", missing))
                 + " ｜问题[" + question + "] 长度" + question.length()
-                + " ｜SQL含'2026-09-01'=" + sql.contains("2026-09-01")
-                + " SQL含create_time=" + sql.contains("create_time");
+                + " ｜WHERE含create_time=" + whereClause(sql).contains("create_time")
+                + " ｜SQL含GROUP BY=" + upperSql(sql).contains("GROUP BY");
 
         if (missing.isEmpty()) {
             log("verify", "问题里的关键条件都已落到 SQL 里");
@@ -537,20 +538,44 @@ public final class FinanceGraph {
     /**
      * 把问题里的关键约束，与 SQL 文本做一次对照。
      *
-     * 【为什么只查「收支方向」和「分类名」这两个维度】
-     *   因为它们正是实测中漏得最多的两类，而且判断起来是确定性的：
-     *     - 收支方向：问题里出现「收入」/「支出」，SQL 里就必须出现对应的中文字面量
-     *     - 分类条件：问题里出现某个分类名（如「餐饮美食」），SQL 里就必须带上它
+     * ============================================================
+     * ⚠️ 这套规则的第一版把三类**正确**的 SQL 误判成了错误
+     * ============================================================
+     *   给「图编排版」补上评测覆盖之后（`Step8Main --graph`），
+     *   立刻暴露了 4 个失败用例，根因全部在这一个方法里 —— 规则写得太粗：
      *
-     *   分类名列表不是硬编码的，而是从 SchemaTool 的 chunk 里取 ——
-     *   也就是**复用第 7 步建好的那套 schema 索引**。好处是往库里加一个新分类，
-     *   这里自动就能识别，不需要改代码。
+     *   1. **只看 `sql.contains("create_time")`，不区分它出现在哪儿**
+     *      「每个月的支出分别是多少？」的正确 SQL 是
+     *        SELECT DATE_FORMAT(create_time,'%Y-%m'), SUM(amount) ... GROUP BY ...
+     *      这里的 create_time 是**分组维度**，却被当成"乱加时间筛选"拦下。
+     *      → 修复：只看 **WHERE 子句**里的 create_time。
      *
-     *   时间区间不在这里查：因为现在已经把区间算好直接给模型了（见 timeReference），
-     *   实测这一步之后时间维度就稳定了，没必要再加一条规则。
+     *   2. **时间词识别不到「8 月」「2026 年 3 月」这类具体时间**
+     *      「8 月的支出比 9 月多多少？」明明有明确时间，规则却说"没提到时间"。
+     *      → 修复：用 `\d+\s*月` / `\d{4}\s*年` 识别具体月份与年份。
+     *
+     *   3. **只拦"多加了"，不拦"少加了"**
+     *      「2026 年 3 月我花了多少钱？」漏了时间条件，
+     *      算出来是全部支出（34504）而不是 3 月的（2950），规则却没拦住。
+     *      → 修复：问题提到**具体**时间时，WHERE 里必须真的有时间条件。
+     *
+     *   ★ 这件事本身是个教训：**规则检查的"粒度"要和语义对齐**。
+     *     我当初用「词有没有出现」这种粗粒度去近似「筛选条件有没有写对」，
+     *     在简单问题上碰巧都对，一旦遇到"同一个字段出现在不同位置"
+     *     就立刻失效 —— 而这类失效在手工样例里根本看不出来。
+     *
+     * ============================================================
+     * 其它设计
+     * ============================================================
+     *   - 分类名不硬编码，从 SchemaTool 的 chunk 里取 ——
+     *     **复用第 7 步建好的 schema 索引**，往库里加新分类这里自动生效。
+     *   - 时间区间不在这里计算：区间已经由程序算好直接交给模型（见 timeReference），
+     *     这里只做"有没有 / 对不对"的核对。
      */
     private static List<String> missingConstraints(String question, String sql) {
         List<String> missing = new ArrayList<>();
+        String upper = upperSql(sql);
+        String where = whereClause(sql);
 
         // ---- ① 收支方向：问题提到就必须落到 SQL 里 ----
         if (question.contains("收入") && !sql.contains("收入")) {
@@ -567,32 +592,95 @@ public final class FinanceGraph {
             }
         }
 
-        // ---- ③ 时间条件的「有无」必须与问题一致 ----
+        // ---- ③ 按月拆分：问题问「每个月」，SQL 就必须有 GROUP BY ----
+        if (mentionsMonthly(question) && !upper.contains("GROUP BY")) {
+            missing.add("问题问的是按月拆分，但 SQL 里没有 GROUP BY —— 那样只会返回一个总数");
+        }
+
+        // ---- ④ 时间条件的「有无」必须与问题一致（★ 只看 WHERE，不看 GROUP BY）----
         // 这条是被一次严重事故逼出来的：把「时间条件参考」放进提示词之后，
         // 模型把它当成了**默认值**，导致「餐饮美食一共花了多少钱」这种
         // 完全没问时间的问题也被加上 9 月筛选 —— 答案从 4096 变成 983。
         // 教训：**往提示词里放参考信息，模型会把它当默认值用**，
         //       所以必须同时给出「什么时候不该用」的规则，并且用代码兜住。
-        boolean mentionsLastMonth = question.contains("上个月") || question.contains("上月");
-        boolean mentionsThisMonth = question.contains("本月")
-                || question.contains("这个月") || question.contains("当月");
-        boolean mentionsTime = mentionsLastMonth || mentionsThisMonth
-                || question.contains("最近") || question.contains("今年") || question.contains("去年");
+        boolean hasTimeFilter = where.contains("create_time");
+        boolean asksTime = mentionsTime(question);
 
-        if (!mentionsTime && sql.contains("create_time")) {
-            missing.add("问题里没有提到任何时间范围，但 SQL 里加了 create_time 筛选。"
+        if (!asksTime && hasTimeFilter) {
+            missing.add("问题里没有提到时间范围，但 SQL 的 WHERE 里加了 create_time 筛选。"
                     + "这会把全量数据错误地限制在一个区间内，请去掉时间条件");
         }
-        // 提到时间的话，还要核对用的是不是**正确的那个区间**。
+        if (asksTime && mentionsConcreteTime(question) && !hasTimeFilter) {
+            missing.add("问题里提到了具体时间（如「8 月」「2026 年 3 月」），"
+                    + "但 SQL 的 WHERE 里没有任何时间条件 —— 会算出全量，而不是那个时间段的数");
+        }
+
+        // 提到相对时间的话，还要核对用的是不是**正确的那个区间**。
         // 这两条能抓住"问本月却筛了上个月"这类错误 —— 光看有没有 create_time 是抓不到的。
-        if (mentionsLastMonth && !sql.contains(lastMonthStart().toString())) {
+        if ((question.contains("上个月") || question.contains("上月"))
+                && !sql.contains(lastMonthStart().toString())) {
             missing.add("问题问的是「上个月」，SQL 的时间区间起点应当是 " + lastMonthStart());
         }
-        if (mentionsThisMonth && !sql.contains(thisMonthStart().toString())) {
+        if ((question.contains("本月") || question.contains("这个月") || question.contains("当月"))
+                && !sql.contains(thisMonthStart().toString())) {
             missing.add("问题问的是「本月」，SQL 的时间区间起点应当是 " + thisMonthStart());
         }
 
         return missing;
+    }
+
+    /** SQL 的大写形式，供关键字判断使用（不改变原 SQL 的大小写） */
+    private static String upperSql(String sql) {
+        return sql == null ? "" : sql.toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * 取出 WHERE 子句的内容（截到 GROUP BY / ORDER BY / HAVING / LIMIT 为止）。
+     *
+     * 【为什么必须单独取出来】
+     *   `create_time` 出现在 WHERE 里是**筛选**，出现在 SELECT / GROUP BY 里是**分组维度**。
+     *   前者需要核对，后者完全合法。
+     *   用一句 `sql.contains("create_time")` 一锅端，就会把「按月份分组」
+     *   这类正确 SQL 判成"乱加时间筛选" —— 这是实测踩到的真实误判。
+     */
+    private static String whereClause(String sql) {
+        String upper = upperSql(sql);
+        int where = upper.indexOf("WHERE");
+        if (where < 0) {
+            return "";
+        }
+        int end = sql.length();
+        for (String keyword : new String[]{"GROUP BY", "ORDER BY", "HAVING", "LIMIT"}) {
+            int idx = upper.indexOf(keyword, where);
+            if (idx > 0 && idx < end) {
+                end = idx;
+            }
+        }
+        return sql.substring(where, end);
+    }
+
+    /** 问题是否提到了任何时间（相对时间词 + 具体年月） */
+    private static boolean mentionsTime(String question) {
+        return mentionsConcreteTime(question)
+                || question.contains("上个月") || question.contains("上月")
+                || question.contains("本月") || question.contains("这个月") || question.contains("当月")
+                || question.contains("最近") || question.contains("今年") || question.contains("去年")
+                || question.contains("年初") || question.contains("季度");
+    }
+
+    /**
+     * 问题是否提到**具体**时间（如「8 月」「2026 年 3 月」）。
+     * 这类问题必须在 WHERE 里落成条件，漏了就一定算错。
+     * 注意「每个月」不含数字，不会被这条匹配到 —— 它是分组需求，走 ③。
+     */
+    private static boolean mentionsConcreteTime(String question) {
+        return question.matches(".*\\d+\\s*月.*") || question.matches(".*\\d{4}\\s*年.*");
+    }
+
+    /** 问题是否要求「按月拆分」—— 这类问题必须有 GROUP BY */
+    private static boolean mentionsMonthly(String question) {
+        return question.contains("每个月") || question.contains("每月") || question.contains("按月")
+                || question.contains("各月") || question.contains("逐月");
     }
 
     /** 从第 7 步的 schema chunk 里取全部分类名（不硬编码，加新分类自动生效） */

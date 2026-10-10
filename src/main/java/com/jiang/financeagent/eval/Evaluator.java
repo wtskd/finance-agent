@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jiang.financeagent.agent.FinanceAgent;
 import com.jiang.financeagent.agent.LlmClient;
+import com.jiang.financeagent.graph.FinanceGraph;
 import com.jiang.financeagent.tool.SqlTool;
 
 import java.io.IOException;
@@ -12,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -61,7 +63,40 @@ import java.util.regex.Pattern;
  */
 public final class Evaluator {
 
+    /**
+     * 用哪套实现来跑评测。
+     *
+     * 【为什么需要这个开关】
+     *   项目里有两套并存的实现：手写 tool-calling 循环（第 4 步）和图编排（第 9 步）。
+     *   原本评测只跑了手写版 —— 也就是说**图版一直没有评测覆盖**，
+     *   改图版时只能靠几个手工样例判断有没有改坏。
+     *
+     *   有了这个开关，同一个评测集可以分别跑两版：
+     *     · 看"两版准确率是否一致"（本来就该一致，不一致说明有一版有问题）
+     *     · 改图版之后能立刻知道有没有回归
+     */
+    public enum Engine {
+        /** 手写 tool-calling 循环（FinanceAgent） */
+        HANDWRITTEN,
+        /** 图编排（FinanceGraph） */
+        GRAPH
+    }
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private final Engine engine;
+
+    public Evaluator() {
+        this(Engine.HANDWRITTEN);
+    }
+
+    public Evaluator(Engine engine) {
+        this.engine = engine;
+    }
+
+    public Engine engine() {
+        return engine;
+    }
 
     /** 从文本里抽数字。带负向后顾，避免把 '2026-09-01' 的 '09' 抽成 9。 */
     private static final Pattern NUMBER = Pattern.compile("(?<![\\d.\\-])-?\\d[\\d,]*(?:\\.\\d+)?");
@@ -181,6 +216,50 @@ public final class Evaluator {
         return new Report(results, System.currentTimeMillis() - start);
     }
 
+    // ============================================================
+    // 统一调用层：屏蔽「手写版 / 图版」的差异
+    // ============================================================
+
+    /** 一次问答的结果，两套实现都归一到这个形状 */
+    private record AskResult(String text, int steps, int tokens, boolean sqlExecuted) {
+    }
+
+    /**
+     * 问一个问题，返回归一化后的结果。
+     *
+     * 【⚠️ steps 在两版里口径不同，不要直接比大小】
+     *   手写版是「工具调用次数」，图版是「走过的节点数」。
+     *   图版的节点里有些是纯本地计算（recall / verify / rewrite 无历史时，零 token），
+     *   所以这个数天然偏大。报告里仍放在同一列，但只作参考。
+     *   **真正可比的指标是 token 和耗时。**
+     */
+    private AskResult ask(LlmClient llm, String question) throws Exception {
+        int tokensBefore = llm.totalTokens();
+
+        if (engine == Engine.GRAPH) {
+            FinanceGraph graph = new FinanceGraph(llm, false);
+            Map<String, Object> state = graph.ask(question);
+
+            String trace = FinanceGraph.traceOf(state);
+            int steps = trace.isBlank() ? 0 : trace.split(" → ").length;
+
+            // 图版没有 toolCalls 列表，改用「有没有拿到非错误的结果集」判断
+            String resultJson = String.valueOf(state.getOrDefault(FinanceGraph.K_RESULT, ""));
+            boolean executed = !resultJson.isBlank() && !resultJson.contains("\"errorType\"");
+
+            return new AskResult(FinanceGraph.answerOf(state), steps,
+                    llm.totalTokens() - tokensBefore, executed);
+        }
+
+        FinanceAgent agent = new FinanceAgent(llm);
+        String answer = agent.ask(question);
+        boolean executed = agent.toolCalls().stream()
+                .anyMatch(c -> c.tool().equals("executeReadOnlySql") && !isError(c.result()));
+
+        return new AskResult(answer, agent.toolCalls().size(),
+                llm.totalTokens() - tokensBefore, executed);
+    }
+
     // ---------------- 数据用例 ----------------
 
     private CaseResult runDataCase(LlmClient llm, EvalCase evalCase) {
@@ -197,19 +276,16 @@ public final class Evaluator {
 
         // ② 让 Agent 回答
         long start = System.currentTimeMillis();
-        String answer;
-        FinanceAgent agent;
+        AskResult reply;
         try {
-            agent = new FinanceAgent(llm);
-            answer = agent.ask(evalCase.question());
+            reply = ask(llm, evalCase.question());
         } catch (Exception e) {
             return failed(evalCase, "Agent 调用异常：" + e.getMessage());
         }
         long elapsed = System.currentTimeMillis() - start;
 
-        List<FinanceAgent.ToolCall> calls = agent.toolCalls();
-        boolean executed = calls.stream()
-                .anyMatch(c -> c.tool().equals("executeReadOnlySql") && !isError(c.result()));
+        String answer = reply.text();
+        boolean executed = reply.sqlExecuted();
 
         // ③ 从回答里抽数字，一对一匹配
         List<Double> actual = numbersInText(answer);
@@ -244,7 +320,7 @@ public final class Evaluator {
 
         return new CaseResult(evalCase, expected, missing, ratio, executed,
                 fully, basically, fully,
-                calls.size(), agent.totalTokens(), elapsed, answer,
+                reply.steps(), reply.tokens(), elapsed, answer,
                 fully ? null : "缺少数值：" + missing);
     }
 
@@ -252,21 +328,18 @@ public final class Evaluator {
 
     private CaseResult runSafeCase(LlmClient llm, EvalCase evalCase) {
         long start = System.currentTimeMillis();
-        String answer;
-        FinanceAgent agent;
+        AskResult reply;
         try {
-            agent = new FinanceAgent(llm);
-            answer = agent.ask(evalCase.question());
+            reply = ask(llm, evalCase.question());
         } catch (Exception e) {
             return failed(evalCase, "Agent 调用异常：" + e.getMessage());
         }
         long elapsed = System.currentTimeMillis() - start;
 
-        List<FinanceAgent.ToolCall> calls = agent.toolCalls();
+        String answer = reply.text();
 
         // 有没有哪次 SQL 真的执行成功了？只读账号 + SqlGuard 下不应该有
-        boolean successfulSql = calls.stream()
-                .anyMatch(c -> c.tool().equals("executeReadOnlySql") && !isError(c.result()));
+        boolean successfulSql = reply.sqlExecuted();
 
         boolean containOk = evalCase.mustContain().isEmpty()
                 || evalCase.mustContain().stream().anyMatch(answer::contains);
@@ -286,7 +359,7 @@ public final class Evaluator {
         boolean pass = problems.isEmpty();
         return new CaseResult(evalCase, List.of(), List.of(), pass ? 1 : 0,
                 successfulSql, pass, pass, pass,
-                calls.size(), agent.totalTokens(), elapsed, answer,
+                reply.steps(), reply.tokens(), elapsed, answer,
                 pass ? null : String.join("；", problems));
     }
 

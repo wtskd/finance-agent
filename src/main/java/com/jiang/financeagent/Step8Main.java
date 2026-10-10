@@ -14,17 +14,26 @@ import java.util.Locale;
  * 第 8 步入口：跑评测集，把「准不准」变成一个数字。
  *
  * 用法：
- *   bash dev.sh run Step8Main                跑全部 20 条
+ *   bash dev.sh run Step8Main                跑全部 26 条（默认测手写版）
+ *   bash dev.sh run Step8Main --graph        改测**图编排版**（FinanceGraph）
  *   bash dev.sh run Step8Main L2             只跑 L2（时间筛选）那 4 条
  *   bash dev.sh run Step8Main D06,D14        只跑指定编号，改完一条立刻重测
+ *   bash dev.sh run Step8Main --graph L7     两个参数可以叠加
  *
  * 【为什么要支持只跑一部分】
  *   全量一轮要几分钟、要花 token。调参时通常只想验证某几条，
  *   支持过滤能让"改一点 → 立刻验证"这个循环转起来。
  *   评测集如果只能整跑，就会变成"最后跑一次给别人看"的摆设。
  *
+ * 【为什么要支持 --graph】
+ *   项目有两套并存的实现（手写循环 / 图编排）。原本评测只覆盖了手写版，
+ *   改图版时只能靠几个手工样例判断有没有改坏 —— 这是真实的盲区。
+ *   加上这个开关后，同一个评测集两版都能跑：
+ *   既能看到"两版是否一致"，也能在改图版时立刻发现回归。
+ *
  * 输出：
- *   控制台（GBK 安全，不用 emoji）+ target/eval-report.md（UTF-8，可贴进 README）
+ *   控制台（GBK 安全，不用 emoji）
+ *   reports/eval-report.md（手写版）/ reports/eval-report-graph.md（图版）
  */
 public class Step8Main {
 
@@ -35,15 +44,25 @@ public class Step8Main {
             return;
         }
 
-        List<EvalCase> cases = filter(EvalSet.all(), args);
+        // --graph：切换被测实现；其余参数照旧当作用例过滤器
+        boolean useGraph = java.util.Arrays.asList(args).contains("--graph");
+        String[] rest = java.util.Arrays.stream(args)
+                .filter(a -> !"--graph".equals(a))
+                .toArray(String[]::new);
+
+        List<EvalCase> cases = filter(EvalSet.all(), rest);
+        Evaluator.Engine engine = useGraph ? Evaluator.Engine.GRAPH : Evaluator.Engine.HANDWRITTEN;
 
         System.out.println("================ 评测开始 ================");
+        System.out.println("被测实现：" + (useGraph
+                ? "图编排（FinanceGraph，10 节点）"
+                : "手写 tool-calling 循环（FinanceAgent）"));
         System.out.println("用例数：" + cases.size() + "（数据 " + cases.stream().filter(EvalCase::isDataCase).count()
                 + " / 安全 " + cases.stream().filter(c -> !c.isDataCase()).count() + "）");
         System.out.println("说明：判分方式 = 黄金 SQL 结果比对（比数字对不对，不比 SQL 写法）");
         System.out.println();
 
-        Evaluator evaluator = new Evaluator();
+        Evaluator evaluator = new Evaluator(engine);
         long start = System.currentTimeMillis();
         Evaluator.Report report = evaluator.run(new LlmClient(apiKey), cases, Step8Main::printCase);
 
@@ -51,7 +70,9 @@ public class Step8Main {
 
         // 报告刻意不写进 target/ —— 那是编译产物目录，mvn clean 会整个删掉，
         // 评测报告是"成果"不是"中间产物"，必须能活过下一次编译。
-        Path md = Evaluator.writeMarkdown(report, Path.of("reports", "eval-report.md"));
+        // 两套实现分开存，避免互相覆盖。
+        String reportName = useGraph ? "eval-report-graph.md" : "eval-report.md";
+        Path md = Evaluator.writeMarkdown(report, Path.of("reports", reportName));
         System.out.println("详细报告已写入：" + md.toAbsolutePath());
         System.out.println("（该文件是 UTF-8，可以直接贴进 README 或作为简历附件）");
     }
