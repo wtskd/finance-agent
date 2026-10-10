@@ -4,3 +4,7 @@
 *.sql  text eol=lf
 *.java text eol=lf
 *.md   text eol=lf
+# 这两个是后加的：不加的话 git 会在下次 checkout 时把工作区文件转成 CRLF，
+# 然后 `git status` 一直显示"已修改"（第 12 步就因为这个排查过一轮）。
+*.json text eol=lf
+*.html text eol=lf
