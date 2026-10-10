@@ -122,9 +122,42 @@ public final class FinanceGraph {
     public static final String K_TRACE = "trace";         // 节点执行轨迹
     public static final String K_VERIFY_NOTE = "verifyNote"; // 需求核对节点的判定结果（排查用）
 
+    /**
+     * 对话历史（多轮用）。每条形如「用户：xxx｜回答：yyy」。
+     * ★ 由**调用方**维护并传入，图自己不记忆 —— 原因见 ask(String, List) 的注释。
+     */
+    public static final String K_HISTORY = "history";
+
+    /** 改写后的问题。只有真的改写过才有值，用来在前端展示"系统理解成了什么" */
+    public static final String K_REWRITTEN = "rewritten";
+
     /** 同一个 SQL 最多重试几次（含第一次）。图里的循环必须设上限，否则会转不出来。 */
     private static final int MAX_ATTEMPTS = 3;
 
+    /** 改写时最多带几轮历史。带太多既费 token，又容易把模型带偏。 */
+    private static final int MAX_HISTORY_ITEMS = 6;
+
+    private static final String REWRITE_PROMPT = """
+            你是多轮对话的「查询改写器」。用户正在和一个财务数据助手对话，
+            新问题里可能省略了上下文（例如用「那……呢」「换成上个月」「这个呢」指代前文）。
+
+            你的任务：把「当前问题」改写成一句**脱离上下文也能独立理解**的完整问题。
+
+            规则：
+            - 有省略或指代时，从对话历史里补全
+            - 当前问题**本身已经完整**时，就**原样返回**，不要画蛇添足
+            - 只做改写：不要回答问题、不要添加用户没提到的条件、不要补充解释
+            - 只输出改写后的问题本身，不要任何前缀、引号或说明文字
+
+            示例：
+              历史：用户问「上个月支出多少」→ 回答「7053 元」
+              当前：「那收入呢」          → 上个月收入是多少？
+              当前：「换成本月呢」        → 本月支出是多少？
+              当前：「餐饮花了多少」      → 餐饮花了多少？
+                                                   （已完整，原样返回）
+            """;
+
+    private static final String NODE_REWRITE = "rewrite";       // 多轮：把省略/指代补全成独立问题
     private static final String NODE_UNDERSTAND = "understand";
     private static final String NODE_RECALL = "recall";
     private static final String NODE_GENERATE = "generate";
@@ -158,6 +191,7 @@ public final class FinanceGraph {
     public CompiledGraph build() throws Exception {
         StateGraph graph = new StateGraph();
 
+        graph.addNode(NODE_REWRITE, AsyncNodeAction.node_async(this::rewrite));
         graph.addNode(NODE_UNDERSTAND, AsyncNodeAction.node_async(this::understand));
         graph.addNode(NODE_RECALL, AsyncNodeAction.node_async(this::recall));
         graph.addNode(NODE_GENERATE, AsyncNodeAction.node_async(this::generate));
@@ -168,7 +202,10 @@ public final class FinanceGraph {
         graph.addNode(NODE_REFUSE, AsyncNodeAction.node_async(this::refuse));
         graph.addNode(NODE_GIVE_UP, AsyncNodeAction.node_async(this::giveUp));
 
-        graph.addEdge(StateGraph.START, NODE_UNDERSTAND);
+        // 入口先是 rewrite（多轮改写），再进 understand 判断可答性 ——
+        // 顺序不能反：判断"能不能答"必须基于**补全后**的完整问题。
+        graph.addEdge(StateGraph.START, NODE_REWRITE);
+        graph.addEdge(NODE_REWRITE, NODE_UNDERSTAND);
 
         // 分支一：问题能不能答 —— 不能答就别浪费后续的模型调用
         graph.addConditionalEdges(NODE_UNDERSTAND, route(),
@@ -216,12 +253,37 @@ public final class FinanceGraph {
         return AsyncEdgeAction.edge_async(state -> String.valueOf(state.value(K_ROUTE).orElse("")));
     }
 
-    /** 跑一次问答。为了状态隔离，每次都新建图（见 build() 注释）。 */
+    /** 跑一次问答（单轮）。为了状态隔离，每次都新建图（见 build() 注释）。 */
     public Map<String, Object> ask(String question) throws Exception {
+        return ask(question, List.of());
+    }
+
+    /**
+     * 跑一次问答（支持多轮）。
+     *
+     * ============================================================
+     * 为什么 history 由调用方维护，而不是让图自己记住
+     * ============================================================
+     *   因为图**每次都是新建的** —— 这是第 9 步那个坑逼出来的设计：
+     *   CompiledGraph 的状态会跨 invoke 残留，所以必须每次现场 build。
+     *   既然图天然无状态，"记住上一轮"就只能放在外面。
+     *
+     *   这反而更干净，职责划分很清楚：
+     *     · **隔离**靠「每次新建图」
+     *     · **记忆**靠「调用方显式传入」
+     *   两者互不干扰 —— 不会出现"想清空记忆却清不掉"的情况。
+     *   （对比一下：如果让图内部持有历史，那"新会话"和"继续上一轮"
+     *     就得靠额外的开关来区分，复杂度立刻上去了。）
+     *
+     * @param history 之前的对话摘要，每条形如「用户：xxx｜回答：yyy」。
+     *                传 null 或空列表等价于单轮提问。
+     */
+    public Map<String, Object> ask(String question, List<String> history) throws Exception {
         Map<String, Object> input = new LinkedHashMap<>();
         input.put(K_QUESTION, question);
         input.put(K_ATTEMPTS, 0);
         input.put(K_TRACE, new ArrayList<String>());
+        input.put(K_HISTORY, new ArrayList<>(history == null ? List.of() : history));
 
         return build().invoke(input)
                 .map(OverAllState::data)
@@ -231,6 +293,63 @@ public final class FinanceGraph {
     // ============================================================
     // 节点实现
     // ============================================================
+
+    /**
+     * 节点 0：查询改写 —— 多轮对话的入口。
+     *
+     * ============================================================
+     * 为什么单独做一个节点，而不是把历史塞进 generate 的提示词
+     * ============================================================
+     *   两个理由：
+     *
+     *   1) **职责单一**。generate 已经在同时处理「时间 + 收支方向 + 分类 + 选表」，
+     *      第 10 步实测证明它总会漏掉其中一项。再往里塞"理解指代"，
+     *      只会让它漏得更多。把「把问题说清楚」从「把问题翻译成 SQL」里拆出来，
+     *      每个节点只做一件事。
+     *
+     *   2) **可观测**。改写结果会写进 K_REWRITTEN 并随 trace 返回，
+     *      前端能直接显示"系统把「那收入呢」理解成了「上个月收入多少」"。
+     *      指代消解错了的时候，一眼就能看出来 ——
+     *      否则这个错误会一路传到 SQL 甚至最终答案才暴露，那时候已经很难定位了。
+     *
+     * ============================================================
+     * ★ 零成本的关键：没有历史时完全不调用模型
+     * ============================================================
+     *   单轮提问（包括全部 26 条评测用例）根本没有上下文需要补全。
+     *   所以下面第一件事就是判断 history.isEmpty() 并直接返回，
+     *   **一次模型调用都不花**。
+     *   这保证了本次改动对单轮场景是纯零影响 —— 也是我敢在投递前一天动它的原因。
+     */
+    private Map<String, Object> rewrite(OverAllState state) throws Exception {
+        String question = str(state, K_QUESTION);
+        List<String> history = historyOf(state);
+
+        if (history.isEmpty()) {
+            log(NODE_REWRITE, "无对话历史，跳过改写（零调用）");
+            return updates(state, NODE_REWRITE, K_ROUTE, "");
+        }
+
+        String rewritten = cleanRewrite(llm.complete(REWRITE_PROMPT, """
+                【对话历史】
+                %s
+
+                【当前问题】
+                %s
+                """.formatted(String.join("\n", recent(history)), question)));
+
+        // 模型认为问题已经完整 → 不改写，也不写 K_REWRITTEN
+        // （这样前端就不会多显示一行"改写"，避免噪音）
+        if (rewritten.isBlank() || rewritten.equals(question)) {
+            log(NODE_REWRITE, "问题已完整，保持原样：" + question);
+            return updates(state, NODE_REWRITE, K_ROUTE, "");
+        }
+
+        log(NODE_REWRITE, "改写：" + question + "  →  " + rewritten);
+        return updates(state, NODE_REWRITE,
+                K_ROUTE, "",
+                K_QUESTION, rewritten,      // ★ 覆盖 K_QUESTION，后续所有节点都基于它
+                K_REWRITTEN, rewritten);
+    }
 
     /**
      * 节点 1：意图理解。
@@ -627,6 +746,19 @@ public final class FinanceGraph {
         return value instanceof Number number ? number.intValue() : 0;
     }
 
+    @SuppressWarnings("unchecked")
+    private static List<String> historyOf(OverAllState state) {
+        Object value = state.value(K_HISTORY).orElse(null);
+        return value instanceof List ? (List<String>) value : List.of();
+    }
+
+    /** 只保留最近若干条历史 —— 带太多既费 token，也容易把模型带偏。 */
+    private static List<String> recent(List<String> history) {
+        return history.size() <= MAX_HISTORY_ITEMS
+                ? history
+                : history.subList(history.size() - MAX_HISTORY_ITEMS, history.size());
+    }
+
     // ============================================================
     // 文本处理
     // ============================================================
@@ -656,6 +788,51 @@ public final class FinanceGraph {
             }
         }
         return s.trim();
+    }
+
+    /**
+     * 清洗模型返回的「改写后的问题」。
+     *
+     * 【和 cleanSql 长得像，为什么不合并】
+     *   两者要剥掉的东西并不相同：SQL 主要防 markdown 代码块，
+     *   问题主要防"改写结果："这类前缀和首尾引号。
+     *   合并成一个通吃的解析器，两边都要塞一堆不属于自己的分支判断 ——
+     *   为了消除几行相似代码而引入一个更复杂的东西，是负收益。
+     */
+    private static String cleanRewrite(String raw) {
+        String s = raw == null ? "" : raw.trim();
+
+        // 模型偶尔仍会包 markdown 代码块
+        if (s.startsWith("```")) {
+            int firstNewline = s.indexOf('\n');
+            if (firstNewline >= 0) {
+                s = s.substring(firstNewline + 1);
+            }
+            int closingFence = s.lastIndexOf("```");
+            if (closingFence >= 0) {
+                s = s.substring(0, closingFence);
+            }
+            s = s.trim();
+        }
+
+        // 去掉前缀（提示词已说明不要加，但它有时还是会加）
+        for (String prefix : new String[]{"改写结果：", "改写后：", "改写：", "结果："}) {
+            if (s.startsWith(prefix)) {
+                s = s.substring(prefix.length()).trim();
+            }
+        }
+
+        // 去掉首尾包裹的引号
+        if (s.length() >= 2 && s.charAt(0) == '"' && s.charAt(s.length() - 1) == '"') {
+            s = s.substring(1, s.length() - 1).trim();
+        }
+
+        // 只取第一行 —— 防止模型在下面又补一句"（说明：……）"
+        int newline = s.indexOf('\n');
+        if (newline > 0) {
+            s = s.substring(0, newline).trim();
+        }
+        return s;
     }
 
     /**
@@ -746,6 +923,29 @@ public final class FinanceGraph {
     public static String answerOf(Map<String, Object> finalState) {
         Object answer = finalState.get(K_ANSWER);
         return answer == null ? "" : answer.toString();
+    }
+
+    /**
+     * 把一轮问答压成一条历史摘要，供下一轮改写使用。
+     *
+     * 【为什么放在这里，而不是各自实现】
+     *   CLI（Step9Main）和 Web（AgentServer）都要往 history 里追加东西。
+     *   如果两处各写一份格式，早晚会漂移成
+     *     "用户：xxx｜回答：yyy" 和 "问: xxx / 答: yyy"
+     *   而改写提示词是按某一种格式调过的 —— 格式一变，指代消解的质量就跟着变。
+     *   统一在这里，两头都用同一个。
+     *
+     * 【为什么要截断回答】
+     *   回答可能很长（尤其是带明细的），原样塞进历史会让下一轮的 prompt 迅速膨胀。
+     *   指代消解需要的是"上一轮聊的是什么话题"，不是完整的答案原文，
+     *   所以保留 120 字符足够。
+     */
+    public static String historyLine(String question, Map<String, Object> state) {
+        String answer = answerOf(state).replaceAll("\\s+", " ").trim();
+        if (answer.length() > 120) {
+            answer = answer.substring(0, 120) + "…";
+        }
+        return "用户：" + question + "｜回答：" + answer;
     }
 
     /** 供测试用：暴露最大尝试次数 */

@@ -15,8 +15,10 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 
 /**
@@ -89,8 +91,51 @@ public final class AgentServer {
 
     private final String apiKey;
 
+    /**
+     * 会话记忆：sessionId → 该会话的历史摘要列表。
+     *
+     * ============================================================
+     * 为什么 Web 层要自己存会话，而图不存
+     * ============================================================
+     *   图每次都是新建的（见 FinanceGraph.build() 的注释），它天然无状态，
+     *   所以"记住上一轮"这件事必须由外部承担。CLI 版是 Step9Main 里的一个局部变量，
+     *   Web 版就是下面这个 Map —— 职责一样，只是生命周期不同：
+     *     · CLI：进程退出就没了
+     *     · Web：服务活着就在，多个浏览器各占一个 sessionId
+     *
+     *   ⚠️ 诚实标注边界：这是**内存会话**，没有 TTL、没有 LRU、没有持久化。
+     *      服务重启会话就丢；长期运行会缓慢吃内存（单会话长度有上限，
+     *      但会话数量本身没有上限）。生产环境应该换成 Redis + TTL，
+     *      这里定位是本地演示。
+     *
+     * 线程安全：用 ConcurrentHashMap.compute —— 它对同一个 key 是原子的，
+     *   并发请求不会把同一个会话的列表写坏。
+     *   （每个请求本身仍然各建各的图，见类注释第二节。）
+     */
+    private final Map<String, List<String>> sessions = new ConcurrentHashMap<>();
+
+    /** 单个会话最多保留多少条历史（约 6 轮），防止 prompt 无限膨胀 */
+    private static final int MAX_SESSION_HISTORY = 12;
+
     public AgentServer(String apiKey) {
         this.apiKey = apiKey;
+    }
+
+    /** 取某个会话的历史（复制一份，避免使用期间被并发改掉） */
+    private List<String> historyOf(String sessionId) {
+        List<String> history = sessions.get(sessionId);
+        return history == null ? List.of() : List.copyOf(history);
+    }
+
+    /** 把一轮对话追加进会话历史，并裁剪到上限 */
+    private void appendHistory(String sessionId, String line) {
+        sessions.compute(sessionId, (id, old) -> {
+            List<String> next = new ArrayList<>(old == null ? List.of() : old);
+            next.add(line);
+            return next.size() <= MAX_SESSION_HISTORY
+                    ? next
+                    : new ArrayList<>(next.subList(next.size() - MAX_SESSION_HISTORY, next.size()));
+        });
     }
 
     public void start(int port) throws IOException {
@@ -145,12 +190,23 @@ public final class AgentServer {
 
         ObjectNode response = M.createObjectNode();
         try {
-            String question = M.readTree(body).path("question").asText("").trim();
+            JsonNode request = M.readTree(body);
+            String question = request.path("question").asText("").trim();
+            String sessionId = request.path("sessionId").asText("").trim();
+
             if (question.isEmpty()) {
                 response.put("ok", false);
                 response.put("error", "问题不能为空");
             } else {
-                Map<String, Object> state = graph.ask(question);
+                // 多轮：把这个会话的历史交给图。图自己不记忆（见 FinanceGraph.ask 的注释）。
+                // 不带 sessionId 时等同于单轮 —— 保持向后兼容。
+                List<String> history = sessionId.isEmpty() ? List.of() : historyOf(sessionId);
+
+                Map<String, Object> state = graph.ask(question, history);
+
+                if (!sessionId.isEmpty()) {
+                    appendHistory(sessionId, FinanceGraph.historyLine(question, state));
+                }
                 fillSuccess(response, state, llm.totalTokens(), System.currentTimeMillis() - start);
             }
         } catch (Exception e) {
@@ -172,6 +228,11 @@ public final class AgentServer {
         response.put("attempts", asInt(state.get(FinanceGraph.K_ATTEMPTS)));
         response.put("sql", asText(state.get(FinanceGraph.K_SQL)));
         response.put("verifyNote", asText(state.get(FinanceGraph.K_VERIFY_NOTE)));
+
+        // 多轮改写：模型把「那收入呢」补全成了什么。
+        // 前端单独显示一行，让用户看得见"系统理解成了什么"。
+        // 没有改写时是空串，前端不显示。
+        response.put("rewritten", asText(state.get(FinanceGraph.K_REWRITTEN)));
 
         // 走了哪些节点 —— 这是图编排相对手写循环最直观的可视化收益
         ArrayNode trace = response.putArray("trace");

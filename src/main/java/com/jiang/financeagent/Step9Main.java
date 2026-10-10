@@ -6,16 +6,25 @@ import com.jiang.financeagent.graph.FinanceGraph;
 import com.jiang.financeagent.util.ConsoleInput;
 import com.jiang.financeagent.util.Text;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 /**
  * 第 9 步入口：跑「图编排版」的财务问数 Agent。
  *
  * 用法：
- *   bash dev.sh run Step9Main                   交互模式
+ *   bash dev.sh run Step9Main                   交互模式（★ 支持多轮对话）
  *   bash dev.sh run Step9Main "上个月支出多少"    单次模式
  *   bash dev.sh run Step9Main --compare "上个月支出多少"
  *                                               同一问题跑两版（手写循环 vs 图编排）并对比
+ *
+ * 【多轮对话是怎么做的】
+ *   入口多了一个 `rewrite` 节点：它读「对话历史 + 当前问题」，
+ *   把「那收入呢」这类省略/指代补全成能独立理解的问题，再交给后面的节点。
+ *   设计要点见 FinanceGraph.rewrite() 的注释。
+ *   交互模式下历史由本类维护（图不记忆），每轮结束后把「用户问 + 回答摘要」
+ *   追加进 history。
  *
  * 【为什么要做 --compare】
  *   重构最容易骗自己的地方是"看起来都能跑"。
@@ -62,10 +71,16 @@ public class Step9Main {
             return;
         }
 
-        // 交互模式
+        // 交互模式（多轮对话）
         ConsoleInput input = new ConsoleInput();
-        System.out.println("=== 财务问数 Agent（图编排版，输入 exit 退出）===");
-        System.out.println("试试问：上个月支出多少？");
+        System.out.println("=== 财务问数 Agent（图编排版 · 多轮对话，输入 exit 退出）===");
+        System.out.println("试试先问：上个月支出多少？   然后接着问：那收入呢？");
+
+        // ★ 对话历史由**调用方**维护，图自己不留记忆 ——
+        //   因为图每次都是新建的（状态隔离要求），它天然无状态。
+        //   见 FinanceGraph.ask(String, List) 的注释。
+        List<String> history = new ArrayList<>();
+        LlmClient llm = new LlmClient(apiKey);   // 会话内复用，累计 token 才准
 
         while (true) {
             System.out.print("\n你> ");
@@ -81,34 +96,58 @@ public class Step9Main {
             if (question.equalsIgnoreCase("exit")) {
                 break;
             }
-            askOnce(apiKey, question);
+            askRound(llm, question, history);
         }
     }
 
+    /** 单次模式 = 没有历史的一轮，直接复用多轮逻辑。 */
     private static void askOnce(String apiKey, String question) throws Exception {
         System.out.println("你> " + question);
-        System.out.println();
+        askRound(new LlmClient(apiKey), question, new ArrayList<>());
+    }
 
-        LlmClient llm = new LlmClient(apiKey);
-        FinanceGraph graph = new FinanceGraph(llm, true);
-
+    /**
+     * 跑一轮问答（支持多轮），打印答案与足迹，并把这一轮追加进 history。
+     *
+     * 【为什么每轮都 new 一个 FinanceGraph】
+     *   状态隔离 —— 见 FinanceGraph.build() 的注释。开销 0.68 ms，可忽略。
+     *   记忆不在图里，在传进来的 history 里。
+     */
+    private static void askRound(LlmClient llm, String question, List<String> history) throws Exception {
+        int tokensBefore = llm.totalTokens();
         long start = System.currentTimeMillis();
-        Map<String, Object> state = graph.ask(question);
+
+        Map<String, Object> state = new FinanceGraph(llm, true).ask(question, history);
+
         long elapsed = System.currentTimeMillis() - start;
+
+        // 追加历史时用的是**用户原话**，不是改写后的问题 ——
+        // 下一轮改写需要看到"用户原本怎么说的"，否则会把改写的痕迹越叠越多。
+        history.add(FinanceGraph.historyLine(question, state));
 
         System.out.println();
         System.out.println("AI> " + Text.forConsole(FinanceGraph.answerOf(state)));
         System.out.println();
-        printFootprint(state, llm, elapsed);
+        printFootprint(state, llm, tokensBefore, elapsed);
     }
 
-    private static void printFootprint(Map<String, Object> state, LlmClient llm, long elapsedMs) {
+    // 历史摘要的格式统一由 FinanceGraph.historyLine 提供，避免 CLI 与 Web 两处写法漂移。
+
+    private static void printFootprint(Map<String, Object> state, LlmClient llm,
+                                       int tokensBefore, long elapsedMs) {
         System.out.println("── 本次执行足迹 ──────────────────────────");
         System.out.println("走过节点 : " + FinanceGraph.traceOf(state));
+
+        Object rewritten = state.get(FinanceGraph.K_REWRITTEN);
+        if (rewritten != null) {
+            System.out.println("问题改写 : " + Text.forConsole(String.valueOf(rewritten)));
+        }
+
         System.out.println("需求核对 : " + state.getOrDefault(FinanceGraph.K_VERIFY_NOTE, "（未经过核对节点）"));
         System.out.println("SQL 尝试 : " + state.getOrDefault(FinanceGraph.K_ATTEMPTS, 0) + " 次");
         System.out.println("最终 SQL : " + state.getOrDefault(FinanceGraph.K_SQL, ""));
-        System.out.println("token    : " + llm.totalTokens());
+        System.out.println("本轮 token : " + (llm.totalTokens() - tokensBefore)
+                + "（累计 " + llm.totalTokens() + "）");
         System.out.println("耗时     : " + elapsedMs + " ms");
     }
 

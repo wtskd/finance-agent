@@ -156,6 +156,10 @@
       <button id="send">发送</button>
     </div>
     <div class="samples" id="samples"></div>
+    <p style="margin:12px 0 0;font-size:12.5px;color:#6b7280">
+      支持多轮追问（例如先问「上个月支出多少」，再问「那收入呢？」）。
+      <a href="#" id="newChat" style="color:#2563eb;text-decoration:none">开始新对话</a>
+    </p>
   </div>
 
   <div class="card hidden" id="statusCard">
@@ -164,6 +168,10 @@
 
   <div class="card hidden" id="traceCard">
     <h2>执行轨迹</h2>
+    <div class="hidden" id="rewrittenRow"
+         style="margin-bottom:12px;padding:8px 12px;border-radius:6px;background:#eff6ff;color:#1d4ed8;font-size:13px">
+      <span id="rewritten"></span>
+    </div>
     <div class="trace" id="trace"></div>
     <div class="meta" style="margin-top:15px" id="metrics"></div>
   </div>
@@ -190,6 +198,7 @@
 // 节点名 → 中文说明。后端只回传节点名，展示文案放在前端，
 // 这样调整措辞不用重新编译 Java。
 const NODE_INFO = {
+  rewrite:    ['理解上下文', '多轮指代消解'],
   understand: ['理解意图',   '判断能否回答'],
   recall:     ['召回表结构', 'Schema 召回 (RAG)'],
   generate:   ['生成 SQL',   '大模型单步生成'],
@@ -213,6 +222,34 @@ const SAMPLES = [
 
 const $ = id => document.getElementById(id);
 const show = (id, on) => $(id).classList.toggle('hidden', !on);
+
+// ============================================================
+// 会话 ID —— 多轮对话靠它把几轮问答串成一次会话
+// ============================================================
+//   服务端用 sessionId 找到这个会话的历史（见 AgentServer 的 sessions 字段）。
+//   存在 localStorage，所以刷新页面后还能接着上一轮聊；
+//   点「开始新对话」就换一个新 ID，等于把上下文清空。
+//
+//   为什么不用 Cookie：这只是一个演示页，不需要跨端同步，
+//   用 localStorage 显式传反而更清楚 —— 你能在 Network 面板里直接看到
+//   sessionId 是怎么带的，排查多轮问题时很直观。
+// ============================================================
+const SID_KEY = 'finance-agent-session-id';
+let sessionId = localStorage.getItem(SID_KEY) || newSessionId();
+
+function newSessionId() {
+  const id = 's-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  localStorage.setItem(SID_KEY, id);
+  return id;
+}
+
+function resetSession() {
+  sessionId = newSessionId();
+  reset();
+  $('q').value = '';
+  $('q').focus();
+  status('<div class="ok">已开始新对话，上下文已清空</div>');
+}
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 // 示例问题
@@ -289,7 +326,7 @@ async function ask() {
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question })
+      body: JSON.stringify({ question, sessionId })
     });
     const data = await res.json();
 
@@ -299,6 +336,16 @@ async function ask() {
     }
 
     show('statusCard', false);
+
+    // 多轮改写：让用户看得见"系统把「那收入呢」理解成了什么"。
+    // 指代消解一旦出错，这一行是最早暴露的地方 ——
+    // 比等 SQL 和答案都出来再怀疑要快得多。
+    if (data.rewritten) {
+      $('rewritten').textContent = '本轮问题被理解成：' + data.rewritten;
+      show('rewrittenRow', true);
+    } else {
+      show('rewrittenRow', false);
+    }
 
     renderTrace(data.trace || []);
     show('traceCard', true);
@@ -329,6 +376,7 @@ async function ask() {
 }
 
 $('send').onclick = ask;
+$('newChat').onclick = e => { e.preventDefault(); resetSession(); };
 $('q').addEventListener('keydown', e => {
   // Ctrl/Cmd + Enter 发送；单独 Enter 换行（问题可能比较长）
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); ask(); }
